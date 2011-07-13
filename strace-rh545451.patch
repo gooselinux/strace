@@ -1,0 +1,21 @@
+commit 840d85b3e50cea9f28aedd23af94742c2a60265a
+Author: Andreas Schwab <schwab@redhat.com>
+Date:   Tue Jan 12 11:16:32 2010 +0100
+
+    Don't kill the process when detaching
+    
+    * strace.c (detach): Call clearbpt when TCB_BPTSET is set.
+
+diff --git a/strace.c b/strace.c
+index d236516..23c3650 100644
+--- a/strace.c
++++ b/strace.c
+@@ -1540,7 +1540,7 @@ int sig;
+ #endif
+ 
+ 	if (tcp->flags & TCB_BPTSET)
+-		sig = SIGKILL;
++		clearbpt(tcp);
+ 
+ #ifdef LINUX
+ 	/*

@@ -1,0 +1,34 @@
+commit 3de3d6bf5abdf410110aed1f844992304f6ae8b9
+Author: Andreas Schwab <schwab@redhat.com>
+Date:   Mon Jan 25 11:32:48 2010 +0100
+
+    Fix spurious failure of AC_STAT64 test
+    
+    * acinclude.m4 (AC_STAT64): Include <sys/types.h> first.
+
+Index: strace-4.5.19/acinclude.m4
+===================================================================
+--- strace-4.5.19.orig/acinclude.m4
++++ strace-4.5.19/acinclude.m4
+@@ -196,7 +196,8 @@ dnl ### A macro to determine whether sta
+ AC_DEFUN([AC_STAT64],
+ [AC_MSG_CHECKING(for stat64 in (asm|sys)/stat.h)
+ AC_CACHE_VAL(ac_cv_type_stat64,
+-[AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[#ifdef LINUX
++[AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[#include <sys/types.h>
++#ifdef LINUX
+ #include <linux/types.h>
+ #include <asm/stat.h>
+ #else
+Index: strace-4.5.19/configure
+===================================================================
+--- strace-4.5.19.orig/configure
++++ strace-4.5.19/configure
+@@ -5343,6 +5343,7 @@ if test "${ac_cv_type_stat64+set}" = set
+ else
+   cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+ /* end confdefs.h.  */
++#include <sys/types.h>
+ #ifdef LINUX
+ #include <linux/types.h>
+ #include <asm/stat.h>

@@ -1,0 +1,221 @@
+Index: strace-4.5.19/defs.h
+===================================================================
+--- strace-4.5.19.orig/defs.h
++++ strace-4.5.19/defs.h
+@@ -322,6 +322,9 @@ extern int mp_ioctl (int f, int c, void 
+ struct tcb {
+ 	short flags;		/* See below for TCB_ values */
+ 	int pid;		/* Process Id of this entry */
++	int wait_status;	/* Status from last wait() */
++	struct tcb *next_need_service;
++				/* Linked list of tracees found by wait()s */
+ 	long scno;		/* System call number */
+ 	int u_nargs;		/* System call arguments */
+ 	long u_arg[MAX_ARGS];	/* System call arguments */
+Index: strace-4.5.19/strace.c
+===================================================================
+--- strace-4.5.19.orig/strace.c
++++ strace-4.5.19/strace.c
+@@ -2329,20 +2329,43 @@ handle_group_exit(struct tcb *tcp, int s
+ }
+ #endif
+ 
+-static int
+-trace()
++#ifdef LINUX
++static int remembered_pid;
++static int remembered_status;
++#endif
++
++static struct tcb *
++collect_stopped_tcbs(void)
+ {
+ 	int pid;
+ 	int wait_errno;
+ 	int status;
+ 	struct tcb *tcp;
++	struct tcb *found_tcps;
+ #ifdef LINUX
++	struct tcb **nextp;
+ 	struct rusage ru;
++	int wnohang = 0;
+ #ifdef __WALL
+ 	static int wait4_options = __WALL;
+ #endif
++
++	if (remembered_pid) {
++		pid = remembered_pid;
++		remembered_pid = 0;
++		if (debug)
++			fprintf(stderr, " [remembered wait(%#x) = %u]\n",
++						remembered_status, pid);
++		tcp = pid2tcb(pid); /* can't be NULL */
++		tcp->wait_status = remembered_status;
++		tcp->next_need_service = NULL;
++		return tcp;
++	}
++
++	nextp = &found_tcps;
+ #endif /* LINUX */
+ 
++	found_tcps = NULL;
+ 	while (nprocs != 0) {
+ 		if (interrupted)
+ 			return 0;
+@@ -2350,25 +2373,25 @@ trace()
+ 			sigprocmask(SIG_SETMASK, &empty_set, NULL);
+ #ifdef LINUX
+ #ifdef __WALL
+-		pid = wait4(-1, &status, wait4_options, cflag ? &ru : NULL);
++		pid = wait4(-1, &status, wait4_options | wnohang, cflag ? &ru : NULL);
+ 		if (pid < 0 && (wait4_options & __WALL) && errno == EINVAL) {
+ 			/* this kernel does not support __WALL */
+ 			wait4_options &= ~__WALL;
+ 			errno = 0;
+-			pid = wait4(-1, &status, wait4_options,
++			pid = wait4(-1, &status, wait4_options | wnohang,
+ 					cflag ? &ru : NULL);
+ 		}
+ 		if (pid < 0 && !(wait4_options & __WALL) && errno == ECHILD) {
+ 			/* most likely a "cloned" process */
+-			pid = wait4(-1, &status, __WCLONE,
++			pid = wait4(-1, &status, __WCLONE | wnohang,
+ 					cflag ? &ru : NULL);
+-			if (pid == -1) {
++			if (pid == -1 && errno != ECHILD) {
+ 				fprintf(stderr, "strace: clone wait4 "
+ 						"failed: %s\n", strerror(errno));
+ 			}
+ 		}
+ #else
+-		pid = wait4(-1, &status, 0, cflag ? &ru : NULL);
++		pid = wait4(-1, &status, wnohang, cflag ? &ru : NULL);
+ #endif /* __WALL */
+ #endif /* LINUX */
+ #ifdef SUNOS4
+@@ -2378,6 +2401,15 @@ trace()
+ 		if (interactive)
+ 			sigprocmask(SIG_BLOCK, &blocked_set, NULL);
+ 
++		if (pid == 0 && wnohang) {
++			/* We had at least one successful
++			 * wait() before. We waited
++			 * with WNOHANG second time.
++			 * Stop collecting more tracees,
++			 * process what we already have.
++			 */
++			break;
++		}
+ 		if (pid == -1) {
+ 			switch (wait_errno) {
+ 			case EINTR:
+@@ -2395,11 +2427,11 @@ trace()
+ 				fprintf(stderr, "strace: proc miscount\n");
+ 				exit(1);
+ #endif
+-				return 0;
++				return found_tcps;
+ 			default:
+ 				errno = wait_errno;
+ 				perror("strace: wait");
+-				return -1;
++				return (struct tcb *) -1;
+ 			}
+ 		}
+ 		if (pid == popen_pid) {
+@@ -2441,8 +2473,6 @@ Process %d attached (waiting for parent)
+ 				exit(1);
+ 			}
+ 		}
+-		/* set current output file */
+-		outf = tcp->outf;
+ 		if (cflag) {
+ #ifdef LINUX
+ 			tv_sub(&tcp->dtime, &ru.ru_stime, &tcp->stime);
+@@ -2461,6 +2491,57 @@ Process %d attached (waiting for parent)
+ 			 */
+ 			continue;
+ 		}
++#ifdef LINUX
++		/* If we waited and got a stopped task notification,
++		 * subsequent wait may return the same pid again, for example,
++		 * with SIGKILL notification. SIGKILL kills even stopped tasks.
++		 * We must not add it to the list
++		 * (one task can't be inserted twice in the list).
++		 */
++		{
++			struct tcb *f = found_tcps;
++			while (f) {
++				if (f == tcp) {
++					remembered_pid = pid;
++					remembered_status = status;
++					return found_tcps;
++				}
++				f = f->next_need_service;
++			}
++		}
++
++		/* It is important to not invert the order of tasks
++		 * to process. For one, alloc_tcb() above picks newly forked
++		 * threads in some order, processing of them and their parent
++		 * should be in the same order, otherwise bad things happen
++		 * (misinterpreted SIGSTOPs and such).
++		 */
++		tcp->wait_status = status;
++		*nextp = tcp;
++		nextp = &tcp->next_need_service;
++		*nextp = NULL;
++		wnohang = WNOHANG;
++#endif
++#ifdef SUNOS4
++		tcp->wait_status = status;
++		tcp->next_need_service = NULL;
++		return tcp;
++#endif
++	}
++	return found_tcps;
++}
++
++static int
++handle_stopped_tcbs(struct tcb *tcp)
++{
++	for (; tcp; tcp = tcp->next_need_service) {
++		int pid;
++		int status;
++
++		outf = tcp->outf;
++		status = tcp->wait_status;
++		pid = tcp->pid;
++
+ 		if (WIFSIGNALED(status)) {
+ 			if (pid == strace_child)
+ 				exit_code = 0x100 | WTERMSIG(status);
+@@ -2674,6 +2755,28 @@ Process %d attached (waiting for parent)
+ 			return -1;
+ 		}
+ 	}
++
++	return 0;
++}
++
++static int
++trace()
++{
++	int rc;
++	struct tcb *tcbs;
++
++	while (nprocs != 0) {
++		if (interrupted)
++			return 0;
++		tcbs = collect_stopped_tcbs();
++		if (!tcbs)
++			break;
++		if (tcbs == (struct tcb *) -1)
++			return -1;
++		rc = handle_stopped_tcbs(tcbs);
++		if (rc)
++			return rc;
++	}
+ 	return 0;
+ }
+ 

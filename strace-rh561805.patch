@@ -1,0 +1,170 @@
+commit 39e5ba33c6aec554e5e257660f4d95f87e10d452
+Author: Andreas Schwab <schwab@redhat.com>
+Date:   Wed Mar 3 17:31:20 2010 +0100
+
+    Try to use PTRACE_SETOPTIONS to handle non-ptrace SIGTRAP
+    
+    * defs.h (USE_PTRACE_SETOPTIONS) [LINUX && PTRACE_SETOPTIONS]:
+    Define.
+    * process.c (internal_exec): Only set TCB_WAITEXECVE on entering.
+    * strace.c (set_ptrace_options, is_ptrace_stop)
+    (is_post_execve_trap): Define.
+    (proc_open): Use them.
+
+Index: strace-4.5.19/defs.h
+===================================================================
+--- strace-4.5.19.orig/defs.h
++++ strace-4.5.19/defs.h
+@@ -305,6 +305,19 @@ extern int mp_ioctl (int f, int c, void 
+ #define PR_FAULTED      S_CORE
+ #endif
+ 
++#if defined LINUX && (defined PTRACE_SETOPTIONS || defined PT_SETOPTIONS)
++# define USE_PTRACE_SETOPTIONS
++# ifndef PTRACE_O_TRACESYSGOOD
++#  define PTRACE_O_TRACESYSGOOD 0x00000001
++# endif
++# ifndef PTRACE_O_TRACEEXEC
++#  define PTRACE_O_TRACEEXEC    0x00000010
++# endif
++# ifndef PTRACE_EVENT_EXEC
++#  define PTRACE_EVENT_EXEC     4
++# endif
++#endif
++
+ /* Trace Control Block */
+ struct tcb {
+ 	short flags;		/* See below for TCB_ values */
+Index: strace-4.5.19/process.c
+===================================================================
+--- strace-4.5.19.orig/process.c
++++ strace-4.5.19/process.c
+@@ -1879,9 +1879,10 @@ struct tcb *tcp;
+ 		fixvfork(tcp);
+ #endif /* SUNOS4 */
+ #if defined LINUX && defined TCB_WAITEXECVE
+-	if (exiting(tcp) && syserror(tcp))
+-		tcp->flags &= ~TCB_WAITEXECVE;
+-	else
++	if (exiting(tcp)) {
++		if (syserror(tcp))
++			tcp->flags &= ~TCB_WAITEXECVE;
++	} else
+ 		tcp->flags |= TCB_WAITEXECVE;
+ #endif /* LINUX && TCB_WAITEXECVE */
+ 	return 0;
+Index: strace-4.5.19/strace.c
+===================================================================
+--- strace-4.5.19.orig/strace.c
++++ strace-4.5.19/strace.c
+@@ -1355,6 +1355,74 @@ int pfd;
+ 
+ #endif /* USE_PROCFS */
+ 
++#ifdef USE_PTRACE_SETOPTIONS
++
++static int use_ptrace_setoptions = 1;
++static int probe_ptrace_setoptions = PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACEEXEC;
++
++static void
++set_ptrace_options(struct tcb *tcp)
++{
++	if (!use_ptrace_setoptions)
++		return;
++
++	/*
++	 * Ask kernel to set signo to SIGTRAP | 0x80
++	 * on ptrace-generated SIGTRAPs, and mark
++	 * execve's SIGTRAP with PTRACE_EVENT_EXEC.
++	 */
++	if (ptrace(PTRACE_SETOPTIONS, tcp->pid, (char *) 0,
++		   PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACEEXEC) < 0 &&
++	    errno != ESRCH)
++		use_ptrace_setoptions = 0;
++}
++
++static int
++is_ptrace_stop(struct tcb *tcp, int status)
++{
++	if (tcp->flags & TCB_STARTUP)
++		/* Didn't have the chance to set ptrace options yet.  */
++		return WSTOPSIG(status) == SIGTRAP;
++
++	if (WSTOPSIG(status) == (SIGTRAP | 0x80)) {
++		/* PTRACE_O_TRACESYSGOOD works. */
++		probe_ptrace_setoptions &= PTRACE_O_TRACESYSGOOD;
++		return 1;
++	}
++	if (WSTOPSIG(status) == SIGTRAP &&
++	    ((unsigned)status >> 16) == PTRACE_EVENT_EXEC) {
++		/* PTRACE_O_TRACEEXEC works. */
++		probe_ptrace_setoptions &= PTRACE_O_TRACEEXEC;
++		return 1;
++	}
++
++	if ((WSTOPSIG(status) == SIGTRAP && probe_ptrace_setoptions))
++		return 1;
++	return 0;
++}
++
++static int
++is_post_execve_trap(struct tcb *tcp, int status)
++{
++	if (!use_ptrace_setoptions)
++		return 0;
++
++	if (WSTOPSIG(status) == SIGTRAP) {
++		if (((unsigned)status >> 16) == PTRACE_EVENT_EXEC)
++			return 1;
++		/* A SIGTRAP received before the first ptrace stop
++		   after attaching is most likely the post-execve trap.  */
++		if ((tcp->flags & (TCB_STARTUP|TCB_ATTACHED)) == (TCB_STARTUP|TCB_ATTACHED))
++			return 1;
++	}
++	return 0;
++}
++#else
++#define set_ptrace_options(tcp)
++#define is_ptrace_stop(tcp, status) (WSTOPSIG(status) == SIGTRAP)
++#define is_post_execve_trap(tcp, status) 0
++#endif
++
+ void
+ droptcb(tcp)
+ struct tcb *tcp;
+@@ -1620,7 +1688,7 @@ int sig;
+ 				break;
+ 			}
+ 			error = ptrace_restart(PTRACE_CONT, tcp,
+-					WSTOPSIG(status) == SIGTRAP ? 0
++					is_ptrace_stop(tcp, status) ? 0
+ 					: WSTOPSIG(status));
+ 			if (error < 0)
+ 				break;
+@@ -2478,10 +2546,11 @@ Process %d attached (waiting for parent)
+ 					return -1;
+ 				}
+ 			}
++			set_ptrace_options(tcp);
+ 			goto tracing;
+ 		}
+ 
+-		if (WSTOPSIG(status) != SIGTRAP) {
++		if (!is_ptrace_stop(tcp, status)) {
+ 			if (WSTOPSIG(status) == SIGSTOP &&
+ 					(tcp->flags & TCB_SIGTRAPPED)) {
+ 				/*
+@@ -2546,6 +2615,13 @@ Process %d attached (waiting for parent)
+ 		/* we handled the STATUS, we are permitted to interrupt now. */
+ 		if (interrupted)
+ 			return 0;
++		/* Ignore post-execve trap. */
++		if (is_post_execve_trap(tcp, status)) {
++#ifdef TCB_WAITEXECVE
++			tcp->flags &= ~TCB_WAITEXECVE;
++#endif
++			goto tracing;
++		}
+ 		if (trace_syscall(tcp) < 0 && !tcp->ptrace_errno) {
+ 			/* ptrace() failed in trace_syscall() with ESRCH.
+ 			 * Likely a result of process disappearing mid-flight.
